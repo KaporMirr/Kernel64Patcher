@@ -3,13 +3,22 @@
 * gcc Kernel64Patcher.c -o Kernel64Patcher
 */
 
+
+#ifdef __gnu_linux__
+    #define _GNU_SOURCE
+#endif
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-
+#include <stdbool.h>
 #include "patchfinder64.c"
 
 #define GET_OFFSET(kernel_len, x) (x - (uintptr_t) kernel_buf)
+
+static uint32_t arm64_branch_instruction(uintptr_t from, uintptr_t to) {
+  return from > to ? 0x18000000 - (from - to) / 4 : 0x14000000 + (to - from) / 4;
+}
 
 // iOS 15 "%s: firmware validation failed %d\" @%s:%d SPU Firmware Validation Patch
 int get_SPUFirmwareValidation_patch(void *kernel_buf, size_t kernel_len) {
@@ -75,13 +84,15 @@ int get_RootVPNotAuthenticatedAfterMounting_patch(void *kernel_buf, size_t kerne
         return -1;
     }
     printf("%s: Found \"md0\" str loc at %p\n",__FUNCTION__,GET_OFFSET(kernel_len,ent_loc));
-    addr_t xref_stuff = xref64(kernel_buf,0,kernel_len,(addr_t)GET_OFFSET(kernel_len, ent_loc));
-    if(!xref_stuff) {
+    addr_t xref_stuff_md = xref64(kernel_buf,0,kernel_len,(addr_t)GET_OFFSET(kernel_len, ent_loc));
+    if(!xref_stuff_md) {
         printf("%s: Could not find \"md0\" xref\n",__FUNCTION__);
         return -1;
     }
-    printf("%s: Found \"md0\" ref at %p\n",__FUNCTION__,(void*)xref_stuff);
-    addr_t next_bl = step64(kernel_buf, xref_stuff + 0x8, 100, INSN_CALL);
+    // this path wasn't working so i had to do this, the cbz before md0
+    /*
+    printf("%s: Found \"md0\" ref at %p\n",__FUNCTION__,(void*)xref_stuff_md);
+    addr_t next_bl = step64(kernel_buf, xref_stuff_md + 0x8, 100, INSN_CALL);
     if(!next_bl) {
         // Newer devices will fail here, so using another string is required
         printf("%s: Failed to use \"md0\", swapping to \"rootvp not authenticated after mounting\"\n",__FUNCTION__);
@@ -91,7 +102,7 @@ int get_RootVPNotAuthenticatedAfterMounting_patch(void *kernel_buf, size_t kerne
             return -1;
         }
         printf("%s: Found \"rootvp not authenticated after mounting\" str loc at %p\n",__FUNCTION__,GET_OFFSET(kernel_len,ent_loc));
-        xref_stuff = xref64(kernel_buf,0,kernel_len,(addr_t)GET_OFFSET(kernel_len, ent_loc));
+        addr_t xref_stuff = xref64(kernel_buf,0,kernel_len,(addr_t)GET_OFFSET(kernel_len, ent_loc));
         if(!xref_stuff) {
             printf("%s: Could not find \"rootvp not authenticated after mounting\" xref\n",__FUNCTION__);
             return -1;
@@ -131,9 +142,17 @@ int get_RootVPNotAuthenticatedAfterMounting_patch(void *kernel_buf, size_t kerne
             return -1;
         }
     }
+
     printf("%s: Patching ROOTVP at %p\n\n", __FUNCTION__,(void*)(next_bl + 0x4));
     *(uint32_t *) (kernel_buf + next_bl + 0x4) = 0xD503201F;
+    */
+    
+    printf("%s: Patching ROOTVP at %p\n\n", __FUNCTION__,(void*)(xref_stuff_md + 0xC));
+    // bl #0x243934 to movz x0, #0x1
+    *(uint32_t *) (kernel_buf + xref_stuff_md - 0xC) = 0xD2800020;
 
+    // bl #0xffffffffffbf0714 (strncmp) to movz x0, #0
+    *(uint32_t *) (kernel_buf + xref_stuff_md + 0x18) = 0xD2800000;
     return 0;
 }
 
@@ -158,6 +177,522 @@ int get_AMFIInitializeLocalSigningPublicKey_patch(void* kernel_buf,size_t kernel
     printf("%s: Patching \"Local Signing Public Key\" at %p\n\n", __FUNCTION__,(void*)(xref_stuff + 0x4));
     *(uint32_t *) (kernel_buf + xref_stuff + 0x4) = 0xD503201F;
     
+    return 0;
+}
+
+// tested on an ipad 6 on ios 13.7, this was done to avoid wait like 2 or 10 minutes when it is booting
+int disableTouchidSensor(void* kernel_buf, size_t kernel_len) {
+    printf("%s: Entering ...\n",__FUNCTION__);
+
+    addr_t xref_stuff;
+    addr_t beg_func;
+    void *str_stuff;
+
+    printf("[*] Patching AppleBiometricSensor\n");
+    str_stuff = memmem(kernel_buf, kernel_len, "_sepTransactResponse", 21);
+    if (!str_stuff)
+    {
+        printf("[-] Failed to find _sepTransactResponse\n");
+        return -1;
+    }
+    xref_stuff = xref64(kernel_buf, 0, kernel_len, (addr_t)GET_OFFSET(kernel_len, str_stuff));
+    beg_func = bof64(kernel_buf, 0, xref_stuff);
+    *(uint32_t *)(kernel_buf + beg_func) = 0x52800000;
+    *(uint32_t *)(kernel_buf + beg_func + 0x4) = 0xD65F03C0;
+    printf("[+] Patched AppleBiometricSensor\n");
+
+    return 0;
+}
+
+// based on seprmvr, thank you so much mineek, i implemented it because here are linux users. 
+int fuck_the_sep(void* kernel_buf, size_t kernel_len) {
+    printf("%s: Entering ...\n",__FUNCTION__);
+
+    addr_t xref_stuff;
+    addr_t beg_func;
+    void *str_stuff;
+    
+    void* xnu_vers = memmem(kernel_buf,kernel_len,"root:xnu-",9);
+    int kernel_vers = atoi(xnu_vers+9);
+
+    printf("[*] Patching sks timeout strike\n");
+    str_stuff = memmem(kernel_buf, kernel_len, "AppleKeyStore: sks timeout strike %d", 36);
+    if (!str_stuff)
+    {
+        printf("[-] Failed to find sks timeout strike\n");
+        return -1;
+    }
+
+    xref_stuff = xref64(kernel_buf, 0, kernel_len, (addr_t)GET_OFFSET(kernel_len, str_stuff));
+    beg_func = bof64(kernel_buf, 0, xref_stuff);
+    *(uint32_t *)(kernel_buf + beg_func) = 0x52800000;
+    *(uint32_t *)(kernel_buf + beg_func + 0x4) = 0xD65F03C0;
+    printf("[+] Patched sks timeout strike\n");
+
+    printf("[*] Patching SEP Panicked\n");
+    str_stuff = memmem(kernel_buf, kernel_len, "\x1b[35m ***** SEP Panicked! dumping log. *****\x1b[0m", 36);
+    // on ios 12.4 kernel sep panicked not work for me. so it just jump this. 
+    int errorsad = 1;
+    if (!str_stuff)
+    {
+        printf("[-] Failed to find SEP Panicked\n");
+        errorsad = 0;
+    }
+
+    if (errorsad == 1)
+    {
+        xref_stuff = xref64(kernel_buf, 0, kernel_len, (addr_t)GET_OFFSET(kernel_len, str_stuff));
+        beg_func = bof64(kernel_buf, 0, xref_stuff);
+        *(uint32_t *)(kernel_buf + beg_func) = 0x52800000;
+        *(uint32_t *)(kernel_buf + beg_func + 0x4) = 0xD65F03C0;
+        printf("[+] Patched SEP Panicked\n");
+    }
+    
+    printf("[*] Patching AppleKeyStore: operation failed\n");
+    str_stuff = memmem(kernel_buf, kernel_len, "AppleKeyStore: operation %s(pid: %d se", 38);
+    if (!str_stuff)
+    {
+        printf("[-] Failed to find AppleKeyStore: operation failed\n");
+        return -1;
+    }
+    xref_stuff = xref64(kernel_buf, 0, kernel_len, (addr_t)GET_OFFSET(kernel_len, str_stuff));
+    while (*(uint32_t *)(kernel_buf + xref_stuff) != 0xD63F0100)
+    {
+        xref_stuff -= 0x4;
+    }
+    *(uint32_t *)(kernel_buf + xref_stuff) = 0xD2800000;
+    printf("[+] Patched AppleKeyStore: operation failed\n");
+
+    if (kernel_vers == 4903) {
+        // did everything needed already for iOS 12
+        printf("%s: quitting...\n", __FUNCTION__);
+        return 0;
+    }
+
+    printf("[*] Patching AppleMesaSEPDriver\n");
+    str_stuff = memmem(kernel_buf, kernel_len, "ERROR: %s: AssertMacros: %s (value = 0x%lx), %s file: %s, line: %d", 66);
+    if (!str_stuff)
+    {
+        printf("[-] Failed to find AppleMesaSEPDriver\n");
+        return -1;
+    }
+    xref_stuff = xref64(kernel_buf, 0, kernel_len, (addr_t)GET_OFFSET(kernel_len, str_stuff));
+    beg_func = bof64(kernel_buf, 0, xref_stuff);
+    *(uint32_t *)(kernel_buf + beg_func) = 0x52800000;
+    *(uint32_t *)(kernel_buf + beg_func + 0x4) = 0xD65F03C0;
+    printf("[+] Patched AppleMesaSEPDriver\n");
+
+    //AppleSEP:WARNING: EP0 received unsolicited message
+    printf("[*] Patching AppleSEP:WARNING: EP0 received unsolicited message\n");
+    str_stuff = memmem(kernel_buf, kernel_len, "AppleSEP:WARNING: EP0 received unsolicited message", 48);
+    if (!str_stuff)
+    {
+        printf("[-] Failed to find AppleSEP:WARNING: EP0 received unsolicited message\n");
+        return -1;
+    }
+    xref_stuff = xref64(kernel_buf, 0, kernel_len, (addr_t)GET_OFFSET(klen, str_stuff));
+    beg_func = bof64(kernel_buf, 0, xref_stuff);
+    *(uint32_t *)(kernel_buf + beg_func) = 0x52800000;
+    *(uint32_t *)(kernel_buf + beg_func + 0x4) = 0xD65F03C0;
+    printf("[+] Patched AppleSEP:WARNING: EP0 received unsolicited message\n");
+
+    //SEP/OS failed to boot at stage
+    printf("[*] Patching SEP/OS failed to boot at stage\n");
+    str_stuff = memmem(kernel_buf, kernel_len, "\"SEP/OS failed to boot at stage %d\\nFirmware type: %s\"@/BuildRoot/Library/Caches/com.apple.xbs/Sources/AppleSEPManager", 96);
+    if (!str_stuff)
+    {
+        printf("[-] Failed to find SEP/OS failed to boot at stage\n");
+        return -1;
+    }
+    xref_stuff = xref64(kernel_buf, 0, kernel_len, (addr_t)GET_OFFSET(kernel_len, str_stuff));
+    beg_func = bof64(kernel_buf, 0, xref_stuff);
+    *(uint32_t *)(kernel_buf + beg_func) = 0x52800000;
+    *(uint32_t *)(kernel_buf + beg_func + 0x4) = 0xD65F03C0;
+    printf("[+] Patched SEP/OS failed to boot at stage\n");
+
+    //AppleBiometricSensor: RECOVERY: Reason %d, Last command 0x%x
+    printf("[*] Patching AppleBiometricSensor: RECOVERY\n");
+    str_stuff = memmem(kernel_buf, kernel_len, "AppleBiometricSensor: RECOVERY: Reason %d, Last command 0x%x", 57);
+    if (!str_stuff)
+    {
+        printf("[-] Failed to find AppleBiometricSensor: RECOVERY\n");
+        return -1;
+    }
+    xref_stuff = xref64(kernel_buf, 0, kernel_len, (addr_t)GET_OFFSET(kernel_len, str_stuff));
+    beg_func = bof64(kernel_buf, 0, xref_stuff);
+    *(uint32_t *)(kernel_buf + beg_func) = 0x52800000;
+    *(uint32_t *)(kernel_buf + beg_func + 0x4) = 0xD65F03C0;
+    printf("[+] Patched AppleBiometricSensor: RECOVERY\n");
+
+    //ERROR: %s: _sensorErrorCounter:%u --> reset\n
+    printf("[*] Patching _sensorErrorCounter: --> reset\n");
+    str_stuff = memmem(kernel_buf, kernel_len, "ERROR: %s: _sensorErrorCounter:%u --> reset\\n", 41);
+    if (!str_stuff)
+    {
+        printf("[-] Failed to find _sensorErrorCounter: --> reset\n");
+        return -1;
+    }
+    xref_stuff = xref64(kernel_buf, 0, kernel_len, (addr_t)GET_OFFSET(kernel_len, str_stuff));
+    beg_func = bof64(kernel_buf, 0, xref_stuff);
+    *(uint32_t *)(kernel_buf + beg_func) = 0x52800000;
+    *(uint32_t *)(kernel_buf + beg_func + 0x4) = 0xD65F03C0;
+    printf("[+] Patched _sensorErrorCounter: --> reset\n");
+    
+    //ERROR: %s: AssertMacros: %s (value = 0x%lx), %s file: %s, line: %d\n\n
+    printf("[*] Patching ERROR: AssertMacros\n");
+    str_stuff = memmem(kernel_buf, kernel_len, "ERROR: %s: AssertMacros: %s (value = 0x%lx), %s file: %s, line: %d", 66);
+    if (!str_stuff)
+    {
+        printf("[-] Failed to find ERROR: AssertMacros\n");
+        return -1;
+    }
+    int done = 0;
+    while (!done)
+    {
+        xref_stuff = xref64(kernel_buf, xref_stuff + 1, kernel_len, (addr_t)GET_OFFSET(klen, str_stuff));
+        if (xref_stuff == 0)
+        {
+            done = 1;
+            break;
+        }
+        beg_func = bof64(kernel_buf, 0, xref_stuff);
+        if (*(uint32_t *)(kernel_buf + beg_func + 0x18) == 0xb4000293)
+        {
+            printf("[+] Skipped ERROR: AssertMacros at 0x%llx\n", beg_func);
+            continue;
+        }
+        *(uint32_t *)(kernel_buf + beg_func) = 0x52800000;
+        *(uint32_t *)(kernel_buf + beg_func + 0x4) = 0xD65F03C0;
+        printf("[+] Patched ERROR: AssertMacros at 0x%llx\n", beg_func);
+    }
+    printf("[+] Patched ERROR: AssertMacros\n");
+    printf("%s: quitting...\n", __FUNCTION__);
+
+    return 0;
+
+}
+
+// load firmware which are not signed like AOP.img4, Homer.img4, etc. ios 15
+int bypassFirmwareValidate15(void* kernel_buf,size_t kernel_len) {
+
+    printf("%s: Entering ...\n",__FUNCTION__);
+
+    char img4_sig_check_string[23] = "firmware authenticated";
+    void* ent_loc = memmem(kernel_buf,kernel_len,img4_sig_check_string,23);
+    if(!ent_loc) {
+        printf("%s: Could not find \"firmware authenticated, OMITING PATCHING...\" string\n",__FUNCTION__);
+        return -1;
+    }
+
+    printf("%s: Found \"firmware authenticated\" str loc at %p\n",__FUNCTION__,GET_OFFSET(kernel_len,ent_loc));
+    addr_t ent_ref = xref64(kernel_buf,0,kernel_len,(addr_t)GET_OFFSET(kernel_len, ent_loc));
+
+    if(!ent_ref) {
+        printf("%s: Could not find \"firmware authenticated\" xref\n",__FUNCTION__);
+        return -1;
+    }
+    printf("%s: Found \"firmware authenticated\" xref at %p\n",__FUNCTION__,(void*)ent_ref);
+
+    printf("%s: Patching \"firmware authenticated\" at %p\n\n", __FUNCTION__,(void*)(ent_ref + 0x24));
+    *(uint32_t *) (kernel_buf + ent_ref + 0x24) = 0xd2800000;
+
+    return 0;
+}
+
+// load firmware which are not signed like AOP.img4, Homer.img4, etc. ios 14
+int bypassFirmwareValidate(void* kernel_buf,size_t kernel_len) {
+
+    printf("%s: Entering ...\n",__FUNCTION__);
+
+    char img4_sig_check_string[55] = "Img4DecodePerformTrustEvaluationWithCallbacks: [%d %s]";
+    void* found = memmem(kernel_buf,kernel_len,img4_sig_check_string,54);
+    if(!found) {
+        printf("%s: Could not find \"%%s::%%s() Img4DecodePerformTrustEvaluationWithCallbacks, OMITING PATCHING...\" string\n",__FUNCTION__);
+        return -1;
+    }
+
+    char img4_wrapped_Image4_payload[27] = "trust evaluation succeeded";
+    void* ent_loc = memmem(kernel_buf,kernel_len,img4_wrapped_Image4_payload,26);
+    if(!ent_loc) {
+        printf("%s: Could not find \"wrapped Image4 payload\" string\n",__FUNCTION__);
+        return -1;
+    }
+
+    printf("%s: Found \"trust evaluation succeeded\" str loc at %p\n",__FUNCTION__,GET_OFFSET(kernel_len,ent_loc));
+    addr_t ent_ref = xref64(kernel_buf,0,kernel_len,(addr_t)GET_OFFSET(kernel_len, ent_loc));
+
+    if(!ent_ref) {
+        printf("%s: Could not find \"%%s::%%s() wrapped Image4 payload\" xref\n",__FUNCTION__);
+        return -1;
+    }
+    printf("%s: Found \"wrapped Image4 payload\" xref at %p\n",__FUNCTION__,(void*)ent_ref);
+
+    printf("%s: Patching \"wrapped Image4 payload\" at %p\n\n", __FUNCTION__,(void*)(ent_ref - 0x20));
+    *(uint32_t *) (kernel_buf + ent_ref - 0x20) = 0xd503201f;
+
+    return 0;
+}
+
+// load firmware which are not signed like AOP.img4, Homer.img4, etc. ios 13
+int bypassFirmwareValidate13(void* kernel_buf,size_t kernel_len) {
+
+    printf("%s: Entering ...\n",__FUNCTION__);
+
+    char first_string[45] = "Image4: Encrypted payloads are not supported";
+    void* found = memmem(kernel_buf,kernel_len,first_string,44);
+    if(!found) {
+        printf("%s: Could not find \"Image4: Encrypted payloads are not supported, OMITING PATCHING...\" string\n",__FUNCTION__);
+        return -1;
+    }
+
+    printf("%s: Found \"Image4: Encrypted payloads are not supported\" str loc at %p\n",__FUNCTION__,GET_OFFSET(kernel_len,found));
+    addr_t found_ref = xref64(kernel_buf,0,kernel_len,(addr_t)GET_OFFSET(kernel_len, found));
+
+    if(!found_ref) {
+        printf("%s: Could not find \"xref of Image4: Encrypted payloads are not supported\" xref\n",__FUNCTION__);
+        return -1;
+    }
+    printf("%s: Found \"Image4: Encrypted payloads are not supported\" xref at %p\n",__FUNCTION__,(void*)found);
+
+    printf("%s: Patching \"patching step 1\" at %p\n\n", __FUNCTION__,(void*)(found_ref + 0x50));
+    *(uint32_t *) (kernel_buf + found_ref + 0x50) = 0xd503201f;
+    printf("%s: Patching \"patching step 2\" at %p\n\n", __FUNCTION__,(void*)(found_ref - 0x50));
+    *(uint32_t *) (kernel_buf + found_ref - 0x50) = 0xd503201f;
+
+   char second_string[34] = "Image4: Payload hash check failed";
+    void* second_found = memmem(kernel_buf,kernel_len,second_string,33);
+    if(!second_found) {
+        printf("%s: Could not find \"Image4: Payload hash check failed, OMITING PATCHING...\" string\n",__FUNCTION__);
+        return -1;
+    }
+
+    printf("%s: Found \"Image4: Payload hash check failed\" str loc at %p\n",__FUNCTION__,GET_OFFSET(kernel_len,second_found));
+    addr_t second_found_ref = xref64(kernel_buf,0,kernel_len,(addr_t)GET_OFFSET(kernel_len, second_found));
+
+    if(!second_found_ref) {
+        printf("%s: Could not find \"xref of Image4: Payload hash check failed\" xref\n",__FUNCTION__);
+        return -1;
+    }
+    printf("%s: Found \"Image4: Payload hash check failed\" xref at %p\n",__FUNCTION__,(void*)second_found_ref);
+
+    printf("%s: Patching \"patching step 3\" at %p\n\n", __FUNCTION__,(void*)(second_found_ref - 0x08));
+    *(uint32_t *) (kernel_buf + second_found_ref - 0x08) = 0x17ffff96;
+
+    return 0;
+}
+
+//iOS 14 AppleFirmwareUpdate img4 signature check
+int get_AppleFirmwareUpdate_img4_signature_check(void* kernel_buf,size_t kernel_len) {
+
+    printf("%s: Entering ...\n",__FUNCTION__);
+
+    char img4_sig_check_string[56] = "%s::%s() Performing img4 validation outside of workloop";
+    void* ent_loc = memmem(kernel_buf,kernel_len,img4_sig_check_string,55);
+    if(!ent_loc) {
+        printf("%s: Could not find \"%%s::%%s() Performing img4 validation outside of workloop\" string\n",__FUNCTION__);
+        return -1;
+    }
+    printf("%s: Found \"%%s::%%s() Performing img4 validation outside of workloop\" str loc at %p\n",__FUNCTION__,GET_OFFSET(kernel_len,ent_loc));
+    addr_t ent_ref = xref64(kernel_buf,0,kernel_len,(addr_t)GET_OFFSET(kernel_len, ent_loc));
+
+    if(!ent_ref) {
+        printf("%s: Could not find \"%%s::%%s() Performing img4 validation outside of workloop\" xref\n",__FUNCTION__);
+        return -1;
+    }
+    printf("%s: Found \"%%s::%%s() Performing img4 validation outside of workloop\" xref at %p\n",__FUNCTION__,(void*)ent_ref);
+
+    printf("%s: Patching \"%%s::%%s() Performing img4 validation outside of workloop\" at %p\n\n", __FUNCTION__,(void*)(ent_ref + 0xc));
+    *(uint32_t *) (kernel_buf + ent_ref + 0xc) = 0xD2800000;
+
+    return 0;
+}
+
+static addr_t
+cbz_ref64_back(const uint8_t *buf, addr_t start, size_t length) {
+
+    //find cbz/cbnz
+    uint32_t cbz_mask = 0x7E000000;
+    uint32_t instr = 0;
+    uint32_t imm = 0;
+    addr_t cbz = start;
+    while (cbz) {
+        instr = *(uint32_t *) (buf + cbz);
+        if ((instr & cbz_mask) == 0x34000000) {
+            imm = ((instr & 0x00FFFFFF) >> 5) << 2;
+            if (cbz + imm == start)
+                return cbz;
+        }
+        cbz -= 4;
+    }
+    return 0;
+}
+
+//iOS 15 "could not authenticate personalized root hash!" patch
+int get_could_not_authenticate_personalized_root_hash_patch(void* kernel_buf,size_t kernel_len) {
+
+    printf("%s: Entering ...\n", __FUNCTION__);
+
+    //get target offset for new branch
+    char roothash_authenticated_string[sizeof("successfully validated on-disk root hash")] = "successfully validated on-disk root hash";
+
+    unsigned char *roothash_authenticated_loc = memmem(kernel_buf, kernel_len, roothash_authenticated_string, sizeof("successfully validated on-disk root hash") - 1);
+    if(!roothash_authenticated_loc) {
+        printf("%s: Could not find \"%s\" string\n", __FUNCTION__, roothash_authenticated_string);
+        return -1;
+    }
+
+    for (; *roothash_authenticated_loc != 0; roothash_authenticated_loc--);
+    roothash_authenticated_loc++;
+    printf("%s: Found \"%s\" str loc at %p\n", __FUNCTION__, roothash_authenticated_string, GET_OFFSET(kernel_len, roothash_authenticated_loc));
+
+    addr_t roothash_authenticated_ref = xref64(kernel_buf,0,kernel_len,(addr_t)GET_OFFSET(kernel_len, roothash_authenticated_loc));
+    if(!roothash_authenticated_ref) {
+        printf("%s: Could not find \"%s\" xref\n",__FUNCTION__, roothash_authenticated_string);
+        return -1;
+    }
+    printf("%s: Found \"%s\" xref at %p\n",__FUNCTION__, roothash_authenticated_string, (void*) roothash_authenticated_ref);
+
+    //get previous cbz
+    addr_t branch_target = step64_back(kernel_buf, roothash_authenticated_ref, 20 * 4, 0x34000000, 0x7E000000);
+    if(!branch_target) {
+        printf("%s: Could not find previous cbz\n",__FUNCTION__);
+        return -1;
+    }
+    printf("%s: Found previous cbz at %p\n",__FUNCTION__, (void*) branch_target);
+    branch_target++;
+
+    //get patching offset for new branch
+    char roothash_failed_string[sizeof("could not authenticate personalized root hash!")] = "could not authenticate personalized root hash!";
+
+    unsigned char *roothash_failed_loc = memmem(kernel_buf, kernel_len, roothash_failed_string, sizeof("could not authenticate personalized root hash!") - 1);
+    if(!roothash_failed_loc) {
+        printf("%s: Could not find \"%s\" string\n", __FUNCTION__, roothash_failed_string);
+        return -1;
+    }
+
+    for (; *roothash_failed_loc != 0; roothash_failed_loc--);
+    roothash_failed_loc++;
+    printf("%s: Found \"%s\" str loc at %p\n", __FUNCTION__, roothash_failed_string, GET_OFFSET(kernel_len, roothash_failed_loc));
+
+    addr_t roothash_failed_ref = xref64(kernel_buf,0,kernel_len,(addr_t)GET_OFFSET(kernel_len, roothash_failed_loc));
+    if(!roothash_failed_ref) {
+        printf("%s: Could not find \"%s\" xref\n",__FUNCTION__, roothash_failed_string);
+        return -1;
+    }
+    printf("%s: Found \"%s\" xref at %p\n",__FUNCTION__, roothash_failed_string, (void*) roothash_failed_ref);
+
+    addr_t patch_loc = 0;
+
+    for (int i = 0; i < 16; i++, roothash_failed_ref -= 4) {
+        if (cbz_ref64_back(kernel_buf, roothash_failed_ref, roothash_failed_ref)) {
+            printf("%s: Found cbz target at %p\n", __FUNCTION__, (void*) roothash_failed_ref);
+            patch_loc = roothash_failed_ref;
+            break;
+        }
+    }
+
+    if (!patch_loc) {
+        printf("%s: Could not find cbz target\n",__FUNCTION__);
+        return -1;
+    }
+
+    printf("%s: Patching root hash check at %p\n",__FUNCTION__, (void*) patch_loc);
+    *((uint32_t *) (kernel_buf + patch_loc)) = arm64_branch_instruction((uintptr_t) patch_loc, (uintptr_t) branch_target);
+
+    return 0;
+}
+
+int get_root_volume_seal_is_broken_patch(void* kernel_buf,size_t kernel_len) {
+
+    printf("%s: Entering ...\n", __FUNCTION__);
+
+    char roothash_authenticated_string[sizeof("\"root volume seal is broken %p\\n\"")] = "\"root volume seal is broken %p\\n\"";
+
+    unsigned char *roothash_authenticated_loc = memmem(kernel_buf, kernel_len, roothash_authenticated_string, sizeof("\"root volume seal is broken %p\\n\"") - 1);
+    if(!roothash_authenticated_loc) {
+        printf("%s: Could not find \"%s\" string\n", __FUNCTION__, roothash_authenticated_string);
+        return -1;
+    }
+
+    for (; *roothash_authenticated_loc != 0; roothash_authenticated_loc--);
+    roothash_authenticated_loc++;
+
+    printf("%s: Found \"%s\" str loc at %p\n", __FUNCTION__, roothash_authenticated_string, GET_OFFSET(kernel_len, roothash_authenticated_loc));
+
+    addr_t roothash_authenticated_ref = xref64(kernel_buf,0,kernel_len,(addr_t)GET_OFFSET(kernel_len, roothash_authenticated_loc));
+    if(!roothash_authenticated_ref) {
+        printf("%s: Could not find \"%s\" xref\n",__FUNCTION__, roothash_authenticated_string);
+        return -1;
+    }
+    printf("%s: Found \"%s\" xref at %p\n",__FUNCTION__, roothash_authenticated_string, (void*) roothash_authenticated_ref);
+
+    addr_t tbnz_ref = step64_back(kernel_buf, roothash_authenticated_ref, 20 * 4, 0x36000000, 0x7E000000);
+    if(!tbnz_ref) {
+        printf("%s: Could not find tbnz\n",__FUNCTION__);
+        return -1;
+    }
+    printf("%s: Found tbnz at %p\n",__FUNCTION__, (void*) tbnz_ref);
+
+    printf("%s: Patching tbnz at %p\n",__FUNCTION__, (void*) tbnz_ref);
+    *((uint32_t *) (kernel_buf + tbnz_ref)) = 0xd503201f;
+    printf("%s: Patched tbnz at %p\n",__FUNCTION__, (void*) tbnz_ref);
+    return 0;
+}
+
+
+
+int get_update_rootfs_rw_patch(void* kernel_buf,size_t kernel_len) {
+
+    printf("%s: Entering ...\n", __FUNCTION__);
+
+    char update_rootfs_rw_string[sizeof("%s:%d: %ss%d:%.0lld Updating mount to read/write mode is not all")] = "%s:%d: %ss%d:%.0lld Updating mount to read/write mode is not all";
+    unsigned char *update_rootfs_rw_loc = memmem(kernel_buf, kernel_len, update_rootfs_rw_string, sizeof("%s:%d: %ss%d:%.0lld Updating mount to read/write mode is not all") - 1);
+    
+    if(!update_rootfs_rw_loc) {
+        
+        char update_rootfs_rw_string[sizeof("%s:%d: %ss%d:%.0lld Updating mount to read/write mode is not all")] = "%s:%d: %ss%d:%.0lld Updating mount to read/write mode is not all";
+        unsigned char *update_rootfs_rw_loc = memmem(kernel_buf, kernel_len, update_rootfs_rw_string, sizeof("%s:%d: %ss%d:%.0lld Updating mount to read/write mode is not all") - 1);
+        if (!update_rootfs_rw_loc)
+        {
+            printf("%s: Could not find \"%s\" string\n", __FUNCTION__, update_rootfs_rw_string);
+            return -1;
+
+        }
+        
+    }
+
+
+    for (; *update_rootfs_rw_loc != 0; update_rootfs_rw_loc--);
+    update_rootfs_rw_loc++;
+
+    printf("%s: Found \"%s\" str loc at %p\n", __FUNCTION__, update_rootfs_rw_string, GET_OFFSET(kernel_len, update_rootfs_rw_loc));
+
+    addr_t update_rootfs_rw_ref = xref64(kernel_buf,0,kernel_len,(addr_t)GET_OFFSET(kernel_len, update_rootfs_rw_loc));
+    if(!update_rootfs_rw_ref) {
+        printf("%s: Could not find \"%s\" xref\n",__FUNCTION__, update_rootfs_rw_string);
+        return -1;
+    }
+
+    printf("%s: Found \"%s\" xref at %p\n",__FUNCTION__, update_rootfs_rw_string, (void*) update_rootfs_rw_ref);
+
+    addr_t tbnz_ref = step64_back(kernel_buf, update_rootfs_rw_ref, 200 * 4, 0x36000000, 0x7E000000);
+    if(!tbnz_ref) {
+        printf("%s: Could not find tbnz\n",__FUNCTION__);
+        return -1;
+    }
+    printf("%s: Found tbnz at %p\n",__FUNCTION__, (void*) tbnz_ref);
+
+    addr_t tbnz_ref2 = step64_back(kernel_buf, tbnz_ref - 4, 200 * 4, 0x36000000, 0x7E000000);
+    if(!tbnz_ref2) {
+        printf("%s: Could not find tbnz\n",__FUNCTION__);
+        return -1;
+    }
+    printf("%s: Found tbnz at %p\n",__FUNCTION__, (void*) tbnz_ref2);
+
+    printf("%s: Patching tbnz at %p\n",__FUNCTION__, (void*) tbnz_ref2);
+    *((uint32_t *) (kernel_buf + tbnz_ref2)) = 0xd503201f;
+    printf("%s: Patched tbnz at %p\n",__FUNCTION__, (void*) tbnz_ref2);
+
     return 0;
 }
 
@@ -214,6 +749,59 @@ int get_amfi_out_of_my_way_patch(void* kernel_buf,size_t kernel_len) {
     return 0;
 }
 
+int is_root_hash_authentication_required_ios_patch(void* kernel_buf,size_t kernel_len) {
+    char authentication_required_string[sizeof("is_root_hash_authentication_required_ios")] = "is_root_hash_authentication_required_ios";
+
+    unsigned char *authentication_required_loc = memmem(kernel_buf, kernel_len, authentication_required_string, sizeof("is_root_hash_authentication_required_ios") - 1);
+
+    if(!authentication_required_loc) {
+        printf("%s: Could not find \"%s\" string\n", __FUNCTION__, authentication_required_string);
+        return -1;
+    }
+
+    printf("%s: Found \"%s\" str loc at %p\n", __FUNCTION__, authentication_required_string, GET_OFFSET(kernel_len, authentication_required_loc));
+
+    addr_t authentication_required_ref = xref64(kernel_buf,0,kernel_len,(addr_t)GET_OFFSET(kernel_len, authentication_required_loc));
+    
+    if(!authentication_required_ref) {
+        printf("%s: Could not find \"%s\" xref\n",__FUNCTION__, authentication_required_string);
+        return -1;
+    }
+
+    printf("%s: Found \"%s\" xref at %p\n",__FUNCTION__, authentication_required_string, (void*) authentication_required_ref);
+    addr_t function = bof64(kernel_buf, 0, authentication_required_ref);
+    
+    printf("%s: Patching is_root_hash_authentication_required_ios at %p\n",__FUNCTION__,(void*)function);
+    
+    *(uint32_t *)(kernel_buf + function) = 0xD2800000;
+    *(uint32_t *)(kernel_buf + function + 0x4) = 0xD65F03C0;
+    return 0;
+}
+
+int launchd_path_patch(void* kernel_buf,size_t kernel_len) {
+
+    char launchd_path_string[sizeof("/sbin/launchd")] = "/sbin/launchd";
+
+    unsigned char *launchd_path_loc = memmem(kernel_buf, kernel_len, launchd_path_string, sizeof("/sbin/launchd") - 1);
+
+    if(!launchd_path_loc) {
+        printf("%s: Could not find \"%s\" string\n", __FUNCTION__, launchd_path_string);
+        return -1;
+    }
+
+    printf("%s: Found \"%s\" str loc at %p\n", __FUNCTION__, launchd_path_string, GET_OFFSET(kernel_len, launchd_path_loc));
+
+    addr_t addr = (addr_t)GET_OFFSET(kernel_len, launchd_path_loc);
+
+    printf("%s: Patching launchd at %p\n",__FUNCTION__,(void*)addr);
+
+    *(uint32_t *)(launchd_path_loc) = 0x69626A2F;
+    *(uint32_t *)(launchd_path_loc + 0x4) = 0x616C2F6E;
+    *(uint32_t *)(launchd_path_loc + 0x8) = 0x68636E75;
+    *(uint32_t *)(launchd_path_loc + 0x12) = 0x64;
+    return 0;
+}
+
 int main(int argc, char **argv) {
     
     printf("%s: Starting...\n", __FUNCTION__);
@@ -221,11 +809,21 @@ int main(int argc, char **argv) {
     FILE* fp = NULL;
     
     if(argc < 4){
+        printf("Version: MOD edwin ;]" "\n");
         printf("Usage: %s <kernel_in> <kernel_out> <args>\n",argv[0]);
         printf("\t-a\t\tPatch AMFI\n");
+        printf("\t-f\t\tPatch AppleFirmwareUpdate img4 signature check\n");
         printf("\t-s\t\tPatch SPUFirmwareValidation (iOS 15 Only)\n");
+        printf("\t-b\t\tBypassFirmwareValidate (IOS14 TESTED), add -b13 -b15 if you want to path ios 13, 15\n");
         printf("\t-r\t\tPatch RootVPNotAuthenticatedAfterMounting (iOS 15 Only)\n");
+        printf("\t-o\t\tPatch could_not_authenticate_personalized_root_hash (iOS 15 Only)\n");
+        printf("\t-e\t\tPatch root volume seal is broken (iOS 15 Only)\n");
+        printf("\t-u\t\tPatch update_rootfs_rw (iOS 15 Only)\n");
         printf("\t-p\t\tPatch AMFIInitializeLocalSigningPublicKey (iOS 15 Only)\n");
+        printf("\t-h\t\tPatch is_root_hash_authentication_required_ios (iOS 16 only)\n");
+        printf("\t-l\t\tPatch launchd path\n");
+        printf("\t-k\t\tPatch fuckthesep, based on seprmvr\n");
+        printf("\t-n\t\tPatch to disable touchIdSensor\n");
         return 0;
     }
     
@@ -279,10 +877,30 @@ int main(int argc, char **argv) {
             printf("Kernel: Adding AMFI_get_out_of_my_way patch...\n");
             get_amfi_out_of_my_way_patch(kernel_buf,kernel_len);
         }
+        if(strcmp(argv[i], "-f") == 0) {
+            printf("Kernel: Adding AppleFirmwareUpdate img4 signature check patch...\n");
+            get_AppleFirmwareUpdate_img4_signature_check(kernel_buf,kernel_len);
+        }
         if(strcmp(argv[i], "-s") == 0) {
             printf("Kernel: Adding SPUFirmwareValidation patch...\n");
             get_SPUFirmwareValidation_patch(kernel_buf,kernel_len);
         }
+
+        if(strcmp(argv[i], "-b") == 0) {
+            printf("Kernel: Adding tbypassFirmwareValidate patch...\n");
+            bypassFirmwareValidate(kernel_buf,kernel_len);
+        }
+
+        if(strcmp(argv[i], "-b13") == 0) {
+            printf("Kernel: Adding tbypassFirmwareValidate patch...\n");
+            bypassFirmwareValidate13(kernel_buf,kernel_len);
+        }
+        
+        if(strcmp(argv[i], "-b15") == 0) {
+            printf("Kernel: Adding tbypassFirmwareValidate patch...\n");
+            bypassFirmwareValidate15(kernel_buf,kernel_len);
+        }
+
         if(strcmp(argv[i], "-p") == 0) {
             printf("Kernel: Adding AMFIInitializeLocalSigningPublicKey patch...\n");
             get_AMFIInitializeLocalSigningPublicKey_patch(kernel_buf,kernel_len);
@@ -290,6 +908,34 @@ int main(int argc, char **argv) {
         if(strcmp(argv[i], "-r") == 0) {
             printf("Kernel: Adding RootVPNotAuthenticatedAfterMounting patch...\n");
             get_RootVPNotAuthenticatedAfterMounting_patch(kernel_buf,kernel_len);
+        }
+        if(strcmp(argv[i], "-o") == 0) {
+            printf("Kernel: Adding could_not_authenticate_personalized_root_hash patch...\n");
+            get_could_not_authenticate_personalized_root_hash_patch(kernel_buf,kernel_len);
+        }
+        if(strcmp(argv[i], "-e") == 0) {
+            printf("Kernel: Adding root volume seal is broken patch...\n");
+            get_root_volume_seal_is_broken_patch(kernel_buf,kernel_len);
+        }
+        if(strcmp(argv[i], "-u") == 0) {
+            printf("Kernel: Adding update_rootfs_rw patch...\n");
+            get_update_rootfs_rw_patch(kernel_buf,kernel_len);
+        }
+        if(strcmp(argv[i], "-h") == 0) {
+            printf("Kernel: Adding is_root_hash_authentication_required_ios patch...\n");
+            is_root_hash_authentication_required_ios_patch(kernel_buf,kernel_len);
+        }
+        if(strcmp(argv[i], "-l") == 0) {
+            printf("Kernel: Adding launchd patch...\n");
+            launchd_path_patch(kernel_buf,kernel_len);
+        }
+        if(strcmp(argv[i], "-k") == 0) {
+            printf("Kernel: SEP patcher...\n");
+            fuck_the_sep(kernel_buf,kernel_len);
+        }
+        if(strcmp(argv[i], "-n") == 0) {
+            printf("Kernel: touch id patcher...\n");
+            disableTouchidSensor(kernel_buf,kernel_len);
         }
     }
     
